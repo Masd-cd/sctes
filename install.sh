@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==========================================
-# Master Installer MasD Tunneling
+# Master Installer MasD Tunneling (FINAL)
 # OS Support: Debian 12
+# Core: Dropbear 2019, Nginx, HAProxy, Python WS
 # ==========================================
 
 clear
 echo "=========================================="
 echo "   Setup Autoscript Tunneling MasD        "
 echo "=========================================="
-# Meminta input domain dan email di awal agar script bisa jalan otomatis setelahnya
 read -p "Masukkan Domain aktif Anda (contoh: myvpn.com): " domain
 read -p "Masukkan Email Anda (untuk daftar SSL Acme): " email
 
@@ -16,21 +16,58 @@ echo ""
 echo "Memulai instalasi dalam 3 detik..."
 sleep 3
 
-# 1. Update & Install Basic Tools
-apt update -y && DEBIAN_FRONTEND=noninteractive apt upgrade -y
-DEBIAN_FRONTEND=noninteractive apt install -y screen curl wget python3 python3-pip nginx haproxy dropbear socat cron systemd
+# 1. Update & Install Basic Tools (Senyap)
+apt update -y
+DEBIAN_FRONTEND=noninteractive apt upgrade -y
+DEBIAN_FRONTEND=noninteractive apt install -y screen curl wget python3 python3-pip nginx haproxy socat cron systemd build-essential zlib1g-dev bzip2 dos2unix
 
-# 2. Setup Dropbear (Port 109 & 143)
-echo "[INFO] Mengkonfigurasi Dropbear..."
-sed -i 's/NO_START=1/NO_START=0/g' /etc/default/dropbear
-sed -i 's/DROPBEAR_PORT=22/DROPBEAR_PORT=143/g' /etc/default/dropbear
-sed -i 's/DROPBEAR_EXTRA_ARGS=.*/DROPBEAR_EXTRA_ARGS="-p 109"/g' /etc/default/dropbear
-systemctl restart dropbear
+# Mendaftarkan /bin/false agar user VPN diizinkan login
+if ! grep -q "/bin/false" /etc/shells; then
+    echo "/bin/false" >> /etc/shells
+fi
+
+# 2. Hapus Dropbear bawaan & Rakit Dropbear 2019 secara manual
+echo "[INFO] Menginstal Dropbear 2019..."
+systemctl stop dropbear &>/dev/null
+apt purge dropbear -y &>/dev/null
+
+cd /tmp
+wget -q https://matt.ucc.asn.au/dropbear/releases/dropbear-2019.78.tar.bz2
+tar -xvjf dropbear-2019.78.tar.bz2
+cd dropbear-2019.78
+./configure
+make
+make install
+
+# Membuat Kunci Keamanan Dropbear agar tidak crash
+mkdir -p /etc/dropbear
+dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key
+dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key
+dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
+
+# Membuat Service Dropbear di Port 143 & 109
+cat << 'EOF' > /etc/systemd/system/dropbear.service
+[Unit]
+Description=Dropbear SSH 2019 MasD
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/dropbear -EF -p 143 -W 65536 -p 109
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
 systemctl enable dropbear
+systemctl start dropbear
 
-# 3. Setup Python WS (Backend)
+# 3. Setup Python WS (Backend di Port 2082)
 echo "[INFO] Mengkonfigurasi Python Websocket..."
-cat <<EOF > /usr/local/bin/ws-python.py
+cat << 'EOF' > /usr/local/bin/ws-python.py
 import socket, threading, select, sys
 
 def proxy(client, target):
@@ -70,8 +107,7 @@ while True:
 EOF
 chmod +x /usr/local/bin/ws-python.py
 
-# Membuat Service agar Python WS jalan 24/7 otomatis
-cat <<EOF > /etc/systemd/system/ws-python.service
+cat << 'EOF' > /etc/systemd/system/ws-python.service
 [Unit]
 Description=Python Websocket Proxy MasD
 After=network.target
@@ -92,6 +128,7 @@ systemctl start ws-python
 
 # 4. Install Acme.sh & Certificate
 echo "[INFO] Memproses Sertifikat SSL..."
+# Matikan Nginx & HAProxy agar port 80 kosong untuk validasi Acme
 systemctl stop nginx
 systemctl stop haproxy
 
@@ -100,7 +137,6 @@ source ~/.bashrc
 ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
 ~/.acme.sh/acme.sh --issue -d $domain --standalone --force
 
-# Buat folder cert untuk HAProxy dan gabungkan file crt + key menjadi .pem
 mkdir -p /etc/haproxy/certs/
 ~/.acme.sh/acme.sh --install-cert -d $domain \
 --fullchain-file /etc/haproxy/certs/$domain.crt \
@@ -108,9 +144,28 @@ mkdir -p /etc/haproxy/certs/
 
 cat /etc/haproxy/certs/$domain.crt /etc/haproxy/certs/$domain.key > /etc/haproxy/certs/$domain.pem
 
-# 5. Konfigurasi HAProxy
-echo "[INFO] Mengkonfigurasi HAProxy..."
-cat <<EOF > /etc/haproxy/haproxy.cfg
+# 5. Konfigurasi Nginx (Port 80 HTTP Proxy to WS)
+echo "[INFO] Mengkonfigurasi Nginx Port 80..."
+rm -f /etc/nginx/sites-enabled/default
+cat << 'EOF' > /etc/nginx/conf.d/websocket.conf
+server {
+    listen 80;
+    server_name _;
+    location / {
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $http_host;
+    }
+}
+EOF
+systemctl restart nginx
+systemctl enable nginx
+
+# 6. Konfigurasi HAProxy (Port 443 HTTPS Proxy to WS)
+echo "[INFO] Mengkonfigurasi HAProxy Port 443..."
+cat << EOF > /etc/haproxy/haproxy.cfg
 global
     log /dev/log local0
     log /dev/log local1 notice
@@ -133,33 +188,29 @@ defaults
 frontend https-in
     bind *:443 ssl crt /etc/haproxy/certs/$domain.pem
     mode http
-    
-    # Deteksi Websocket, jika ya lempar ke backend python WS
     acl is_websocket hdr(Upgrade) -i websocket
     use_backend ws-backend if is_websocket
-    
     default_backend ws-backend
 
 backend ws-backend
     mode http
     server ws-server 127.0.0.1:2082 check
 EOF
-
 systemctl restart haproxy
 systemctl enable haproxy
 
+# 7. Menginstal Menu Manajemen
+echo "[INFO] Menginstal Menu Manajemen..."
 cat << 'EOF' > /usr/local/bin/menu
 #!/bin/bash
 # ==========================================
 # Menu Manajemen MasD Tunneling
 # ==========================================
-
-# Warna untuk tampilan terminal
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 clear
 echo -e "${BLUE}==========================================${NC}"
@@ -170,7 +221,7 @@ echo -e " 2. Hapus Akun"
 echo -e " 3. Perpanjang Masa Aktif Akun"
 echo -e " 4. Cek Akun yang Sedang Login"
 echo -e " 5. Lihat Daftar Semua Akun"
-echo -e " 6. Restart Semua Service (Websocket, SSH, HAProxy)"
+echo -e " 6. Restart Semua Service"
 echo -e " 0. Keluar"
 echo -e "${BLUE}==========================================${NC}"
 read -p "Pilih menu [0-6]: " menu
@@ -182,14 +233,9 @@ case $menu in
         read -p "Masukkan Username : " user
         read -p "Masukkan Password : " pass
         read -p "Masa Aktif (hari) : " aktif
-
-        # Menghitung tanggal expired
         expdate=$(date -d "+$aktif days" +"%Y-%m-%d")
-        
-        # Membuat user tanpa akses shell penuh (demi keamanan)
         useradd -e $expdate -s /bin/false -M $user
-        echo -e "$pass\n$pass" | passwd $user &> /dev/null
-        
+        echo "$user:$pass" | chpasswd
         clear
         echo -e "${GREEN}Akun Berhasil Dibuat!${NC}"
         echo -e "=========================="
@@ -197,8 +243,6 @@ case $menu in
         echo -e "Password   : $pass"
         echo -e "Expired    : $expdate"
         echo -e "=========================="
-        echo -e "Format Payload Websocket:"
-        echo -e "GET / HTTP/1.1[crlf]Host: [domainmu][crlf]Connection: Upgrade[crlf]User-Agent: [ua][crlf]Upgrade: websocket[crlf][crlf]"
         ;;
     2)
         clear
@@ -212,8 +256,6 @@ case $menu in
         echo -e "${YELLOW}--- Perpanjang Masa Aktif ---${NC}"
         read -p "Masukkan Username: " user
         read -p "Tambahan Aktif (hari): " aktif
-        
-        # Mengubah tanggal expired user
         expdate=$(date -d "+$aktif days" +"%Y-%m-%d")
         chage -E $expdate $user
         echo -e "${GREEN}Masa aktif $user berhasil diperpanjang hingga $expdate.${NC}"
@@ -221,16 +263,13 @@ case $menu in
     4)
         clear
         echo -e "${BLUE}--- Cek User Login (Dropbear) ---${NC}"
-        # Membaca log dropbear untuk melihat siapa yang terhubung
         cat /var/log/auth.log | grep -i dropbear | grep -i "Password auth succeeded" > /tmp/login-db.txt
         echo -e "Daftar koneksi terakhir:"
         cat /tmp/login-db.txt | awk '{print $1,$2,$3,$10}' | tail -n 10
-        echo -e "\n(Catatan: IP asli mungkin tersembunyi di balik HAProxy/Cloudflare)"
         ;;
     5)
         clear
         echo -e "${YELLOW}--- Daftar Semua Akun ---${NC}"
-        # Menampilkan user yang memiliki masa aktif
         awk -F: '$3>=1000 {print $1}' /etc/passwd | while read user; do
             exp=$(chage -l $user | grep "Account expires" | awk -F": " '{print $2}')
             echo -e "Username: $user | Expired: $exp"
@@ -239,9 +278,7 @@ case $menu in
     6)
         clear
         echo -e "${GREEN}Merestart Service...${NC}"
-        systemctl restart dropbear
-        systemctl restart ws-python
-        systemctl restart haproxy
+        systemctl restart dropbear ws-python haproxy nginx
         echo -e "${GREEN}Service berhasil direstart!${NC}"
         ;;
     0)
@@ -252,18 +289,17 @@ case $menu in
         echo -e "${RED}Pilihan tidak valid!${NC}"
         ;;
 esac
-
 EOF
-
 chmod +x /usr/local/bin/menu
 
 echo "=========================================="
 echo " Instalasi Selesai!                       "
 echo "=========================================="
 echo " Domain      : $domain"
-echo " Port HTTPS  : 443 (Websocket SSL)"
-echo " Port SSH    : 143, 109"
-echo " Websocket   : 2082 (Internal)"
+echo " Port HTTPS  : 443 (Websocket SSL via HAProxy)"
+echo " Port HTTP   : 80 (Websocket via Nginx)"
+echo " Port SSH    : 143, 109 (Dropbear 2019)"
+echo " Websocket   : 2082 (Internal Python)"
 echo "=========================================="
+echo "Ketik 'menu' untuk mengatur user VPS Anda."
 echo "Ketik 'reboot' lalu tekan enter untuk memulai ulang VPS."
-    
